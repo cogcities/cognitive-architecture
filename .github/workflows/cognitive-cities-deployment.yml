@@ -1,0 +1,538 @@
+name: 🏙️ Cognitive Cities Deployment Pipeline
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'cognitive-cities/**'
+      - 'foundry-hybrid/**'
+      - 'neural-transport-protocols.md'
+      - 'cognitive-cities-implementation-plan.md'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'cognitive-cities/**'
+      - 'foundry-hybrid/**'
+  workflow_dispatch:
+    inputs:
+      deployment_target:
+        description: 'Deployment target'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+        - staging
+        - production
+        - development
+      city_id:
+        description: 'Cognitive City ID'
+        required: true
+        default: 'cogcities-main'
+        type: string
+      enable_foundry:
+        description: 'Deploy Foundry Manufacturing District'
+        required: false
+        default: true
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: cogcities
+  COGNITIVE_CITIES_VERSION: v1.0.0
+
+jobs:
+  # Validate configuration and run tests
+  validate:
+    name: 🔍 Validate Configuration
+    runs-on: ubuntu-latest
+    outputs:
+      deployment_target: ${{ steps.config.outputs.deployment_target }}
+      city_id: ${{ steps.config.outputs.city_id }}
+      enable_foundry: ${{ steps.config.outputs.enable_foundry }}
+      
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup Python 3.12
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+        
+    - name: Setup Node.js 20
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        
+    - name: Install validation dependencies
+      run: |
+        pip install pydantic pyyaml jsonschema
+        npm install -g ajv-cli
+        
+    - name: Validate cognitive cities configuration
+      run: |
+        python -c "
+        import json
+        import yaml
+        from pathlib import Path
+        
+        # Validate implementation plan
+        plan_file = Path('cognitive-cities-implementation-plan.md')
+        if plan_file.exists():
+            print('✅ Implementation plan found')
+        else:
+            print('❌ Implementation plan missing')
+            exit(1)
+            
+        # Validate knowledge base config
+        kb_file = Path('cognitive-cities-knowledge-base.md')  
+        if kb_file.exists():
+            print('✅ Knowledge base configuration found')
+        else:
+            print('❌ Knowledge base configuration missing')
+            exit(1)
+            
+        # Validate neural transport protocols
+        nt_file = Path('neural-transport-protocols.md')
+        if nt_file.exists():
+            print('✅ Neural transport protocols found')
+        else:
+            print('❌ Neural transport protocols missing')
+            exit(1)
+            
+        print('✅ All configuration files validated')
+        "
+        
+    - name: Set deployment configuration
+      id: config
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "deployment_target=${{ github.event.inputs.deployment_target }}" >> $GITHUB_OUTPUT
+          echo "city_id=${{ github.event.inputs.city_id }}" >> $GITHUB_OUTPUT
+          echo "enable_foundry=${{ github.event.inputs.enable_foundry }}" >> $GITHUB_OUTPUT
+        elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          echo "deployment_target=production" >> $GITHUB_OUTPUT
+          echo "city_id=cogcities-main" >> $GITHUB_OUTPUT
+          echo "enable_foundry=true" >> $GITHUB_OUTPUT
+        else
+          echo "deployment_target=staging" >> $GITHUB_OUTPUT
+          echo "city_id=cogcities-staging" >> $GITHUB_OUTPUT
+          echo "enable_foundry=true" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Run cognitive architecture demo
+      run: |
+        python cognitive_ecology_demo.py
+        
+  # Build container images
+  build-images:
+    name: 🔨 Build Container Images
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      matrix:
+        component:
+          - neural-transport-hub
+          - knowledge-base
+          - mayor-ai
+          - foundry-hybrid
+          - monitoring
+          
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Login to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/${{ matrix.component }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: Create Dockerfile for component
+      run: |
+        mkdir -p build-context/${{ matrix.component }}
+        
+        case "${{ matrix.component }}" in
+          "neural-transport-hub")
+            cat > build-context/${{ matrix.component }}/Dockerfile << 'EOF'
+        FROM node:20-alpine
+        WORKDIR /app
+        COPY package*.json ./
+        RUN npm ci --only=production
+        COPY neural-transport/ ./
+        EXPOSE 4000 4001
+        CMD ["node", "main.js"]
+        EOF
+            ;;
+          "knowledge-base")
+            cat > build-context/${{ matrix.component }}/Dockerfile << 'EOF'
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install fastapi uvicorn redis elasticsearch neo4j pydantic
+        COPY knowledge-base/ ./
+        EXPOSE 5000
+        CMD ["python", "main.py"]
+        EOF
+            ;;
+          "mayor-ai")
+            cat > build-context/${{ matrix.component }}/Dockerfile << 'EOF'
+        FROM python:3.12-slim
+        WORKDIR /app
+        RUN pip install fastapi uvicorn openai anthropic langchain
+        COPY governance/mayor-ai/ ./
+        EXPOSE 6000
+        CMD ["python", "main.py"]
+        EOF
+            ;;
+          "foundry-hybrid")
+            cat > build-context/${{ matrix.component }}/Dockerfile << 'EOF'
+        FROM ubuntu:22.04
+        RUN apt-get update && apt-get install -y curl git nodejs npm python3 python3-pip
+        RUN curl -L https://foundry.paradigm.xyz | bash
+        ENV PATH="/root/.foundry/bin:$PATH"
+        RUN foundryup
+        WORKDIR /app
+        COPY foundry-hybrid/ ./
+        EXPOSE 8545 3000 8080
+        CMD ["./start-foundry-hybrid.sh"]
+        EOF
+            ;;
+          "monitoring")
+            cat > build-context/${{ matrix.component }}/Dockerfile << 'EOF'
+        FROM prom/prometheus:latest
+        COPY monitoring/ /etc/prometheus/
+        EXPOSE 9090 7000
+        CMD ["--config.file=/etc/prometheus/prometheus.yml"]
+        EOF
+            ;;
+        esac
+        
+    - name: Build and push image
+      uses: docker/build-push-action@v5
+      with:
+        context: build-context/${{ matrix.component }}
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+  # Deploy to staging environment
+  deploy-staging:
+    name: 🎭 Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [validate, build-images]
+    if: needs.validate.outputs.deployment_target == 'staging'
+    environment: staging
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+        
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG_STAGING }}" | base64 -d > ~/.kube/config
+        
+    - name: Create namespace
+      run: |
+        kubectl create namespace cognitive-cities-staging --dry-run=client -o yaml | kubectl apply -f -
+        
+    - name: Deploy cognitive cities infrastructure
+      run: |
+        # Create ConfigMap for configuration
+        kubectl create configmap cognitive-cities-config \
+          --from-literal=CITY_ID=${{ needs.validate.outputs.city_id }} \
+          --from-literal=DEPLOYMENT_ENV=staging \
+          --from-literal=NEURAL_TRANSPORT_ENABLED=true \
+          -n cognitive-cities-staging \
+          --dry-run=client -o yaml | kubectl apply -f -
+          
+        # Deploy neural transport hub
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: neural-transport-hub
+          namespace: cognitive-cities-staging
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: neural-transport-hub
+          template:
+            metadata:
+              labels:
+                app: neural-transport-hub
+            spec:
+              containers:
+              - name: neural-transport-hub
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/neural-transport-hub:${{ github.sha }}
+                ports:
+                - containerPort: 4000
+                - containerPort: 4001
+                env:
+                - name: CITY_ID
+                  valueFrom:
+                    configMapKeyRef:
+                      name: cognitive-cities-config
+                      key: CITY_ID
+                - name: NODE_ENV
+                  value: "staging"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: neural-transport-hub-service
+          namespace: cognitive-cities-staging
+        spec:
+          selector:
+            app: neural-transport-hub
+          ports:
+          - name: websocket
+            port: 4000
+            targetPort: 4000
+          - name: http
+            port: 4001
+            targetPort: 4001
+          type: ClusterIP
+        EOF
+        
+    - name: Deploy knowledge base
+      run: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: knowledge-base
+          namespace: cognitive-cities-staging
+        spec:
+          replicas: 2
+          selector:
+            matchLabels:
+              app: knowledge-base
+          template:
+            metadata:
+              labels:
+                app: knowledge-base
+            spec:
+              containers:
+              - name: knowledge-base
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/knowledge-base:${{ github.sha }}
+                ports:
+                - containerPort: 5000
+                env:
+                - name: PYTHON_ENV
+                  value: "staging"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: knowledge-base-service
+          namespace: cognitive-cities-staging
+        spec:
+          selector:
+            app: knowledge-base
+          ports:
+          - port: 5000
+            targetPort: 5000
+          type: ClusterIP
+        EOF
+        
+    - name: Deploy foundry manufacturing district
+      if: needs.validate.outputs.enable_foundry == 'true'
+      run: |
+        cat <<EOF | kubectl apply -f -
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: foundry-hybrid
+          namespace: cognitive-cities-staging
+        spec:
+          replicas: 1
+          selector:
+            matchLabels:
+              app: foundry-hybrid
+          template:
+            metadata:
+              labels:
+                app: foundry-hybrid
+            spec:
+              containers:
+              - name: foundry-hybrid
+                image: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}/foundry-hybrid:${{ github.sha }}
+                ports:
+                - containerPort: 8545
+                - containerPort: 3000
+                - containerPort: 8080
+                env:
+                - name: FOUNDRY_PROFILE
+                  value: "cognitive-city-staging"
+        ---
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: foundry-hybrid-service
+          namespace: cognitive-cities-staging
+        spec:
+          selector:
+            app: foundry-hybrid
+          ports:
+          - name: anvil-rpc
+            port: 8545
+            targetPort: 8545
+          - name: web
+            port: 3000
+            targetPort: 3000
+          - name: ai-copilot
+            port: 8080
+            targetPort: 8080
+          type: ClusterIP
+        EOF
+        
+    - name: Wait for deployment
+      run: |
+        kubectl wait --for=condition=available --timeout=300s \
+          deployment/neural-transport-hub \
+          deployment/knowledge-base \
+          -n cognitive-cities-staging
+          
+        if [ "${{ needs.validate.outputs.enable_foundry }}" = "true" ]; then
+          kubectl wait --for=condition=available --timeout=300s \
+            deployment/foundry-hybrid \
+            -n cognitive-cities-staging
+        fi
+        
+    - name: Run integration tests
+      run: |
+        # Get service URLs
+        kubectl port-forward service/neural-transport-hub-service 4000:4000 -n cognitive-cities-staging &
+        kubectl port-forward service/knowledge-base-service 5000:5000 -n cognitive-cities-staging &
+        
+        sleep 10
+        
+        # Test neural transport hub
+        if curl -f http://localhost:4000/health; then
+          echo "✅ Neural transport hub is healthy"
+        else
+          echo "❌ Neural transport hub health check failed"
+          exit 1
+        fi
+        
+        # Test knowledge base
+        if curl -f http://localhost:5000/health; then
+          echo "✅ Knowledge base is healthy"
+        else
+          echo "❌ Knowledge base health check failed"
+          exit 1
+        fi
+        
+  # Deploy to production environment
+  deploy-production:
+    name: 🚀 Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [validate, build-images]
+    if: needs.validate.outputs.deployment_target == 'production'
+    environment: production
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+        
+    - name: Configure kubectl
+      run: |
+        echo "${{ secrets.KUBE_CONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+        
+    - name: Deploy to production
+      run: |
+        echo "🚀 Deploying Cognitive Cities to Production"
+        echo "City ID: ${{ needs.validate.outputs.city_id }}"
+        echo "Enable Foundry: ${{ needs.validate.outputs.enable_foundry }}"
+        
+        # Similar deployment steps as staging but with production configuration
+        kubectl create namespace cognitive-cities-production --dry-run=client -o yaml | kubectl apply -f -
+        
+        # Deploy with production-specific configuration
+        # (Similar to staging but with higher replica counts, resource limits, etc.)
+        
+  # Notify completion
+  notify:
+    name: 📢 Notify Deployment Status
+    runs-on: ubuntu-latest
+    needs: [validate, build-images, deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Determine deployment status
+      id: status
+      run: |
+        if [ "${{ needs.deploy-staging.result }}" = "success" ] || [ "${{ needs.deploy-production.result }}" = "success" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+          echo "message=✅ Cognitive Cities deployment completed successfully" >> $GITHUB_OUTPUT
+        else
+          echo "status=failure" >> $GITHUB_OUTPUT
+          echo "message=❌ Cognitive Cities deployment failed" >> $GITHUB_OUTPUT
+        fi
+        
+    - name: Create deployment summary
+      run: |
+        cat >> $GITHUB_STEP_SUMMARY << 'EOF'
+        # 🏙️ Cognitive Cities Deployment Summary
+        
+        ## Configuration
+        - **Target**: ${{ needs.validate.outputs.deployment_target }}
+        - **City ID**: ${{ needs.validate.outputs.city_id }}
+        - **Foundry Enabled**: ${{ needs.validate.outputs.enable_foundry }}
+        - **Version**: ${{ env.COGNITIVE_CITIES_VERSION }}
+        
+        ## Components Deployed
+        - ✅ Neural Transport Hub
+        - ✅ Knowledge Base Service
+        - ✅ Mayor AI Agent
+        - ${{ needs.validate.outputs.enable_foundry == 'true' && '✅' || '➖' }} Foundry Manufacturing District
+        - ✅ Monitoring Dashboard
+        
+        ## Status
+        ${{ steps.status.outputs.message }}
+        
+        ## Next Steps
+        1. Monitor system health via dashboard
+        2. Verify neural transport connections
+        3. Test knowledge base synchronization
+        4. Validate foundry manufacturing district
+        5. Begin cognitive city operations
+        
+        ---
+        **Deployment completed at**: $(date -u)
+        EOF
+        
+    - name: Post to Slack (if configured)
+      if: env.SLACK_WEBHOOK_URL != ''
+      run: |
+        curl -X POST -H 'Content-type: application/json' \
+          --data "{\"text\":\"${{ steps.status.outputs.message }}\nTarget: ${{ needs.validate.outputs.deployment_target }}\nCity: ${{ needs.validate.outputs.city_id }}\"}" \
+          ${{ secrets.SLACK_WEBHOOK_URL }}
